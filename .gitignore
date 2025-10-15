@@ -13,3 +13,6 @@ parts/
 bin/
 var/
 util.cpython*-*.so
+.json
+*.log
+*.html
