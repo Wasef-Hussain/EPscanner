@@ -1,0 +1,15 @@
+cli.cpython*-*.so
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+parts/
+bin/
+var/
+util.cpython*-*.so
