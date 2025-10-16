@@ -1,9 +1,19 @@
 import argparse
 import sys
 import json
+import asyncio
+import aiohttp
+from aiohttp import ClientTimeout
 import time
+# debug: inspect how many URLs have query params
+import pprint
 from typing import List
 from util import gather_endpoints_for_domains, render_html_report  # using the multi-domain runner
+from util import (
+        check_reflected_xss,
+        check_sqli_fingerprints,
+        check_open_redirect
+    )
 
 BANNER = r"""
 =========================================
@@ -95,56 +105,28 @@ def _interactive_save(results: dict):
 
 def _interactive_menu(results: dict):
     """
-    Show the interactive menu until the user exits.
-    results is a mapping domain -> list_of_urls.
+    Interactive menu that can run active safe checks (XSS/SQLi/Open Redirect)
+    using run_checks(...) from util.py, or save outputs.
+    Expects the helper functions _load_saved_json, _write_json, _write_html,
+    _interactive_save, and the heuristic helpers to exist in this module (as you have).
     """
     import json
+    import re
+    import time
+    # import run_checks from util (synchronous wrapper over async checks)
+    try:
+        from util import run_checks
+    except Exception:
+        run_checks = None
 
-    def _load_saved_json(path: str):
-        """Load saved JSON file and normalize to {domain: [url, ...]}."""
-        try:
-            with open(path, 'r', encoding='utf-8') as fh:
-                data = json.load(fh)
-        except Exception as e:
-            print(f"[!] Could not open/read file: {e}")
-            return None
-
-        # Accept either the 'overall' structure or a simple mapping
-        if isinstance(data, dict) and 'targets' in data:
-            targets = data['targets']
-            norm = {}
-            for dom, info in targets.items():
-                eps = info.get('endpoints', [])
-                urls = []
-                for ep in eps:
-                    if isinstance(ep, dict) and 'url' in ep:
-                        urls.append(ep['url'])
-                    elif isinstance(ep, str):
-                        urls.append(ep)
-                norm[dom] = urls
-            return norm
-        # fallback: maybe user saved a simple dict domain->list
-        if isinstance(data, dict):
-            # ensure values are lists of strings
-            ok = True
-            for k, v in data.items():
-                if not isinstance(v, list):
-                    ok = False
-                    break
-            if ok:
-                return data
-        print("[!] Unrecognized JSON structure in file.")
-        return None
-
-    # --- lightweight placeholder checks ---
+    # re-use your existing _load_saved_json, heuristics, _print_findings, etc.
+    # I'll re-declare the heuristics minimally here to keep behavior consistent:
     def xss_check(input_results: dict):
-        """Heuristic: flag URLs containing query params or obvious 'search' keys as XSS candidates."""
         findings = {}
         for dom, urls in input_results.items():
             f = []
             for u in urls:
                 if '?' in u and ('=' in u):
-                    # treat any URL with query params as a potential XSS surface (very coarse)
                     f.append(f"Potential injectable param URL: {u}")
                 elif any(tok in u.lower() for tok in ['/search', '/query', '/q/']):
                     f.append(f"Search-like endpoint (inspect): {u}")
@@ -153,12 +135,10 @@ def _interactive_menu(results: dict):
         return findings
 
     def sqli_check(input_results: dict):
-        """Heuristic: flag endpoints with numeric-looking IDs or query params as SQLi candidates."""
         findings = {}
         for dom, urls in input_results.items():
             f = []
             for u in urls:
-                # basic heuristics
                 if re.search(r"(id=|item=|product=)\d+", u, re.I):
                     f.append(f"ID parameter found (inspect for SQLi): {u}")
                 elif '?' in u and ('=' in u):
@@ -168,7 +148,6 @@ def _interactive_menu(results: dict):
         return findings
 
     def open_redirect_check(input_results: dict):
-        """Heuristic: flag endpoints with common redirect param names (next, url, redirect)."""
         redirect_params = ('next=', 'url=', 'redirect=', 'return=')
         findings = {}
         for dom, urls in input_results.items():
@@ -194,7 +173,124 @@ def _interactive_menu(results: dict):
                 if shown >= 10:
                     return
 
-    print('Discovery step complete. Next: run safe checks (XSS/SQLi/open-redirect) — to be implemented as Step 2.')
+    def _maybe_save_findings_raw(raw_data: dict, prefix="findings"):
+        """Save the raw findings dict (already JSON-serializable) to timestamped JSON/HTML files."""
+        try:
+            save = input("Save detailed findings to disk? (y)es/(n)o: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled save.")
+            return
+        if save not in ('y', 'yes'):
+            return
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        jname = f"{prefix}-{ts}.json"
+        hname = f"{prefix}-{ts}.html"
+        try:
+            with open(jname, 'w', encoding='utf-8') as fh:
+                json.dump({'generated_at': time.time(), 'findings': raw_data}, fh, indent=2)
+            print(f"[+] Detailed findings JSON written to {jname}")
+        except Exception as e:
+            print(f"[!] Failed to write findings JSON: {e}")
+
+        # create a minimal HTML for quick viewing
+        try:
+            html_parts = [f"<h1>Findings - {time.ctime()}</h1>"]
+            for dom, urls in raw_data.items():
+                html_parts.append(f"<h2>{dom} ({len(urls)} endpoints)</h2>")
+                for url, checks in urls.items():
+                    html_parts.append(f"<h3>{url}</h3><ul>")
+                    for cname, cres in checks.items():
+                        vuln = cres.get("vulnerable", False)
+                        html_parts.append(f"<li><strong>{cname}:</strong> {'VULNERABLE' if vuln else 'no findings'}</li>")
+                        for d in cres.get("details", [])[:50]:
+                            html_parts.append(f"<li>{json.dumps(d)}</li>")
+                    html_parts.append("</ul>")
+            with open(hname, 'w', encoding='utf-8') as fh:
+                fh.write("\n".join(html_parts))
+            print(f"[+] Detailed findings HTML written to {hname}")
+        except Exception as e:
+            print(f"[!] Failed to write findings HTML: {e}")
+
+    async def run_async_checks(kind: str, results: dict, verbose=False):
+        """Run async safe checks using aiohttp for given kind: xss/sqli/redirect/all."""
+        sem = asyncio.Semaphore(5)
+        findings = {}
+
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for dom, urls in results.items():
+                if not isinstance(urls, (list, tuple)):
+                    # normalize: skip bad shapes
+                    if verbose:
+                        print(f"[debug] skipping domain {dom} because urls is not a list")
+                    findings.setdefault(dom, [])
+                    continue
+
+                domain_has_candidate = False
+                for url in urls:
+                    # only test URLs that contain params
+                    if '?' not in url:
+                        continue
+
+                    domain_has_candidate = True
+
+                    if kind == "xss":
+                        coro = check_reflected_xss(session, url, sem, verbose)
+                    elif kind == "sqli":
+                        coro = check_sqli_fingerprints(session, url, sem, verbose)
+                    elif kind == "redirect":
+                        coro = check_open_redirect(session, url, sem, verbose)
+                    else:
+                        continue
+
+                    tasks.append((dom, url, asyncio.create_task(coro)))
+
+            # ensure the domain key exists even if there were no param URLs
+            if not domain_has_candidate:
+                if verbose:
+                    print(f"[!] No param-bearing URLs for domain {dom} to test for {kind}")
+                findings.setdefault(dom, [])
+
+        if not tasks:
+            if verbose:
+                print(f"[!] No URLs with parameters found to test for {kind}.")
+            return findings
+
+        # run tasks in small batches to limit concurrency (we already use sem but this keeps memory lower)
+        for dom, url, task in tasks:
+            try:
+                res = await task
+            except Exception as e:
+                if verbose:
+                    print(f"[!] {kind} check failed on {url}: {e}")
+                continue
+
+            if res and res.get("vulnerable"):
+                findings.setdefault(dom, []).append({"url": url, "details": res.get("details", [])})
+        
+        return findings
+   
+    
+
+    
+    def _load_saved_json(path: str) -> dict:
+        """Load previously saved JSON file with discovered endpoints."""
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            targets = data.get('targets', {})
+            loaded = {}
+            for dom, info in targets.items():
+                eps = info.get('endpoints', [])
+                urls = [e.get('url') for e in eps if 'url' in e]
+                loaded[dom] = urls
+            return loaded
+        except Exception as e:
+            print(f"[!] Could not load JSON from {path}: {e}")
+            return None
+    
+    # Top-level loop
+    print('Discovery step complete. Next: run safe checks (XSS/SQLi/open-redirect).')
     while True:
         print('\nHere are three options to proceed:')
         print('1. Run the checks now')
@@ -209,7 +305,7 @@ def _interactive_menu(results: dict):
             return
 
         if choice == '1':
-            # allow selecting current in-memory results or loading from file
+            # choose data source
             print("\nRun checks now — choose data source:")
             print("  a. Use the endpoints discovered in this run (in-memory)")
             print("  b. Load endpoints from a previously saved JSON file")
@@ -253,25 +349,115 @@ def _interactive_menu(results: dict):
                 print("Cancelled checks.")
                 continue
 
+            # If run_checks wrapper is available, run active safe checks; otherwise fall back to active.
+            if run_checks is None:
+                print("[!] Running active only.")
+                if sub == 'a':
+                    findings = asyncio.run(run_async_checks("xss", use_results, verbose=True))
+                    _print_findings(findings, "Reflected XSS (Active Check)")
+                elif sub == 'b':
+                    findings = asyncio.run(run_async_checks("sqli", use_results, verbose=True))
+                    _print_findings(findings, "SQLi (Active Check)")
+                elif sub == 'c':
+                    findings = asyncio.run(run_async_checks("redirect", use_results, verbose=True))
+                    _print_findings(findings, "Open Redirect (Active Check)")
+                elif sub == 'd':
+                    f1 = asyncio.run(run_async_checks("xss", use_results, verbose=True))
+                    f2 = asyncio.run(run_async_checks("sqli", use_results, verbose=True))
+                    f3 = asyncio.run(run_async_checks("redirect", use_results, verbose=True))
+                    print("\n--- Combined scan results ---")
+                    _print_findings(f1, "XSS (Active Check)")
+                    _print_findings(f2, "SQLi (Active Check)")
+                    _print_findings(f3, "Open Redirect (Active Check)")
+                    # offer to save active combined findings in simple form
+                    try:
+                        saveh = input("Save active findings? (y/n): ").strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        saveh = 'n'
+                    if saveh in ('y','yes'):
+                        combined = {"xss": f1, "sqli": f2, "redirect": f3}
+                        _maybe_save_findings_raw(combined, prefix="active-findings")
+                continue  # return to top menu
+
+            # build selected check list
             if sub == 'a':
-                findings = xss_check(use_results)
-                _print_findings(findings, "XSS heuristic")
+                selected = ["xss"]
             elif sub == 'b':
-                findings = sqli_check(use_results)
-                _print_findings(findings, "SQLi heuristic")
+                selected = ["sqli"]
             elif sub == 'c':
-                findings = open_redirect_check(use_results)
-                _print_findings(findings, "Open Redirect heuristic")
+                selected = ["redirect"]
             elif sub == 'd':
-                f1 = xss_check(use_results)
-                f2 = sqli_check(use_results)
-                f3 = open_redirect_check(use_results)
-                print("\n--- Combined scan results ---")
-                _print_findings(f1, "XSS heuristic")
-                _print_findings(f2, "SQLi heuristic")
-                _print_findings(f3, "Open Redirect heuristic")
+                selected = ["xss", "sqli", "redirect"]
             else:
                 print("Invalid choice for checks. Choose a / b / c / d or press ENTER to cancel.")
+                continue
+
+            # Ask user to confirm running active checks (safety)
+            print("\n*** Safety reminder: active checks will send harmless test payloads to endpoints.")
+            print("Only run against targets you own or have permission to test.")
+            try:
+                ok = input("Proceed? (y/n): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                ok = 'n'
+            if ok not in ('y', 'yes'):
+                print("Cancelled active checks.")
+                continue
+
+            # run checks (synchronous wrapper)
+            print("[*] Running active checks (this may take a while).")
+            # default parameters; you can expose these through CLI flags if desired
+            findings = n(use_results, checks=selected, max_concurrency=20, per_domain_limit=200, verbose=False)
+
+            # summarize findings
+            total_items = 0
+            domains_with_issues = 0
+            for dom, urlmap in findings.items():
+                dom_count = 0
+                for url, checksmap in urlmap.items():
+                    for cname, cres in checksmap.items():
+                        if cres.get("vulnerable"):
+                            dom_count += len(cres.get("details", []))
+                if dom_count:
+                    domains_with_issues += 1
+                    total_items += dom_count
+
+            print(f"[+] Active checks complete. Total potential findings: {total_items} across {domains_with_issues} domain(s).")
+
+            # offer to save full detailed findings (JSON + HTML)
+            try:
+                save_full = input("Save full detailed findings to disk? (y/n): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                save_full = 'n'
+            if save_full in ('y', 'yes'):
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                fname = f"findings-{ts}.json"
+                try:
+                    with open(fname, 'w', encoding='utf-8') as fh:
+                        json.dump({'generated_at': time.time(), 'findings': findings}, fh, indent=2)
+                    print(f"[+] Wrote findings JSON to {fname}")
+                except Exception as e:
+                    print(f"[!] Failed to write findings JSON: {e}")
+                # also write a small HTML summary
+                hname = f"findings-{ts}.html"
+                try:
+                    html_parts = [f"<h1>Findings - {time.ctime()}</h1>"]
+                    for dom, urlmap in findings.items():
+                        html_parts.append(f"<h2>{dom}</h2>")
+                        for url, checksmap in urlmap.items():
+                            html_parts.append(f"<h3>{url}</h3><ul>")
+                            for cname, cres in checksmap.items():
+                                html_parts.append(f"<li>{cname}: {'VULNERABLE' if cres.get('vulnerable') else 'no findings'}</li>")
+                                for d in cres.get('details', [])[:50]:
+                                    html_parts.append(f"<li><pre>{json.dumps(d)}</pre></li>")
+                            html_parts.append("</ul>")
+                    with open(hname, 'w', encoding='utf-8') as fh:
+                        fh.write("\n".join(html_parts))
+                    print(f"[+] Wrote findings HTML to {hname}")
+                except Exception as e:
+                    print(f"[!] Failed to write findings HTML: {e}")
+
+            # done — return to main menu
+            continue
 
         elif choice == '2':
             print("Save discovered endpoints for later.")
