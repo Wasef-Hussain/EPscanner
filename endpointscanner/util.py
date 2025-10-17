@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+import traceback
 from typing import List, Set, Dict
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, ParseResult, urljoin, quote
 
@@ -72,7 +73,7 @@ SQL_ERROR_SIGS = [
     "unclosed quotation mark after the character string", "pg_query(", "sql syntax",
     "mysql_fetch", "oracle error"
 ]
-CHECK_TIMEOUT = ClientTimeout(total=8)          # per-request timeout
+CHECK_TIMEOUT = ClientTimeout(total=10)          # per-request timeout
 def make_semaphore():
     return asyncio.Semaphore(MAX_CONCURRENT)
 
@@ -221,27 +222,9 @@ async def crawl_domain(session, base_url, crawl_pages=50, verbose=False):
 
     return found
 
-async def async_gather_endpoints(domain, crawl_pages=50, verbose=False):
-    """Scan a single domain asynchronously"""
-    base_url = f"http://{domain}"
-    async with aiohttp.ClientSession() as session:
-        crawled = await crawl_domain(session, base_url, crawl_pages, verbose)
-        found = await asyncio.gather(
-            *(fetch_status(session, url, verbose) for url in crawled),
-            return_exceptions=True
-        )
-    return {url for url in found if isinstance(url, str)}
 
 
-async def async_gather_endpoints_for_domains(domains, crawl_pages=50, verbose=False):
-    """Run endpoint discovery concurrently for multiple domains within one loop"""
-    tasks = [
-        asyncio.create_task(async_gather_endpoints(domain, crawl_pages, verbose))
-        for domain in domains
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    # pair each domain with its set of endpoints
-    return dict(zip(domains, results))
+
 
 # --------------------- Passive discovery ---------------------
 async def passive_discovery(session, domain, verbose=False):
@@ -312,16 +295,10 @@ async def crawl(session, domain_root, max_pages=50, max_depth=2, verbose=False):
 
 
 # --------------------- Gather all endpoints ---------------------
-async def async_gather_endpoints(domain, crawl_pages=50, verbose=False):
-    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
-        passive = await passive_discovery(session, domain, verbose)
-        probe = await probe_common_paths(session, domain, verbose=verbose)  # <-- fixed here
-        crawlset = await crawl(session, domain, max_pages=crawl_pages, verbose=verbose)
-        return passive | probe | crawlset
 
 
-def gather_endpoints(domain, crawl_pages=50, verbose=False):
-    return asyncio.run(async_gather_endpoints(domain, crawl_pages, verbose))
+
+
 
 async def async_gather_endpoints_single(session, domain, crawl_pages=50, verbose=False):
     """
@@ -356,40 +333,34 @@ async def async_gather_endpoints_single(session, domain, crawl_pages=50, verbose
     for u in list(passive)[:6]:
         json_candidates |= await extract_urls_from_json_endpoint(session, u, sem, verbose=verbose)
 
-    return passive | probe | crawlset
+    return passive | probe | crawlset | js_candidates | json_candidates
 
 
-async def _async_gather_domains(domains, crawl_pages=50, verbose=False):
-    """
-    Internal concurrent runner for multiple domains within one event loop.
-    Returns dict: domain -> set(endpoints) or exception.
-    """
+async def _async_gather_domains(session, domains, crawl_pages=50, verbose=False):
     results = {}
-    # Use a single session reused across domains (better performance)
-    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT) as session:
-        # create tasks for each domain
-        tasks = {domain: asyncio.create_task(async_gather_endpoints_single(session, domain, crawl_pages, verbose))
-                 for domain in domains}
+    async with session:
+        tasks = {
+            domain: asyncio.create_task(
+                async_gather_endpoints_single(session, domain, crawl_pages, verbose)
+            )
+            for domain in domains
+        }
 
-        # await them and collect results
         for domain, task in tasks.items():
             try:
-                res = await task
-                results[domain] = res
+                results[domain] = await task
             except Exception as e:
-                # store exception to let caller handle it
                 results[domain] = e
     return results
 
-
-def gather_endpoints_for_domains(domains, crawl_pages=50, verbose=False):
+async def gather_endpoints_for_domains(session, domains, crawl_pages=50, verbose=False):
     """
     Synchronous wrapper that runs the async scan for multiple domains in a single event loop.
     Returns dict: domain -> set(endpoints) or exception.
     """
     if isinstance(domains, str):
         domains = [domains]
-    return asyncio.run(_async_gather_domains(domains, crawl_pages=crawl_pages, verbose=verbose))
+    return await _async_gather_domains(session, domains, crawl_pages=crawl_pages, verbose=verbose)
 
 
 # Backwards-compatible single-domain wrapper (optional)
@@ -478,109 +449,87 @@ def init_debug_prints(verbose: bool = False, prefix: str = "[xss]") -> None:
 
 
 async def check_reflected_xss(
-    session,
+      session: aiohttp.ClientSession,
     url: str,
     sem: asyncio.Semaphore,
     verbose: bool = False,
 ) -> Dict:
     """
-    For a single `url` with query params, inject inert markers from XSS_MARKERS into each param
-    (one marker at a time) and check whether the marker (or common transformed forms) appears
+    For a single `url` with query params, inject markers from XSS_MARKERS
+    into each param (one marker at a time) and check if the marker appears
     in the response body.
 
     Returns: {"vulnerable": bool, "details": [ {param, tested_url, evidence}, ... ]}
     """
-    # effective verbosity: call-time override > global init
-    do_print = verbose or VERBOSE_PRINTS
-
+    do_print = verbose or globals().get("VERBOSE_PRINTS", False)
     parsed = urlparse(url)
-    qs = parse_qs(parsed.query)  # values are lists
-    print(qs)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
     findings = []
 
     if do_print:
-        print(f"{PRINT_PREFIX} start check_reflected_xss: url={url} params={list(qs.keys())} markers={len(XSS_MARKERS)}")
+        print(f"{globals().get('PRINT_PREFIX', '')} start check_reflected_xss: url={url} params={list(qs.keys())} markers={len(globals().get('XSS_MARKERS', []))}")
 
     if not qs:
         if do_print:
-            print(f"{PRINT_PREFIX} no query params for url={url}; skipping")
+            print(f"{globals().get('PRINT_PREFIX', '')} no query params for url={url}; skipping")
         return {"vulnerable": False, "details": []}
 
-    # iterate params and each marker
-    for param in qs.keys():
-        # original param values (take first element for non-list semantics)
+    async def test_marker(param: str, marker: str):
         original_values = {k: (v[:] if isinstance(v, list) else [v]) for k, v in qs.items()}
+        new_qs = {k: (marker if k == param else v[0]) for k, v in original_values.items()}
+        new_query = urlencode(new_qs, doseq=False)
+        test_url = urlunparse(ParseResult(parsed.scheme, parsed.netloc, parsed.path,
+                                          parsed.params, new_query, parsed.fragment))
         if do_print:
-            sample_vals = {k: (v[0] if v else "") for k, v in original_values.items()}
-            print(f"{PRINT_PREFIX} testing param='{param}' original_values={sample_vals}")
-
-        for marker in XSS_MARKERS:
-            # build query where only `param` is replaced with marker (single value)
-            new_qs = {}
-            for k, vals in original_values.items():
-                if k == param:
-                    # use single string for this param
-                    new_qs[k] = marker
-                else:
-                    # keep first original value (common behaviour)
-                    new_qs[k] = vals[0] if vals else ''
-
-            # urlencode with doseq=False because values are strings
-            new_query = urlencode(new_qs, doseq=False)
-            test_parsed = ParseResult(parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
-            test_url = urlunparse(test_parsed)
-
-            if do_print:
-                # print a truncated marker to avoid huge output
-                truncated_marker = (marker[:60] + "...") if len(marker) > 60 else marker
-                print(f"{PRINT_PREFIX} requesting test_url={test_url} (param={param} marker={truncated_marker})")
-
-            try:
-                start_ts = time.perf_counter()
-                async with sem:
-                    async with session.get(test_url, timeout=CHECK_TIMEOUT) as resp:
-                        elapsed = time.perf_counter() - start_ts
-                        status = getattr(resp, "status", None)
+            truncated_marker = (marker[:60] + "...") if len(marker) > 60 else marker
+            print(f"{globals().get('PRINT_PREFIX', '')} requesting test_url={test_url} (param={param} marker={truncated_marker})")
+        try:
+            start_ts = time.perf_counter()
+            async with sem:
+                async with session.get(test_url, timeout=globals().get("CHECK_TIMEOUT", 10)) as resp:
+                    elapsed = time.perf_counter() - start_ts
+                    status = getattr(resp, "status", None)
+                    try:
                         text = await resp.text(errors="ignore")
-                        text_len = len(text) if text is not None else 0
+                    except Exception:
+                        text = ""
 
+                    if do_print:
+                        print(f"{globals().get('PRINT_PREFIX', '')} response: status={status} time={elapsed:.3f}s len={len(text)}")
+
+                    seen_func = globals().get("seen_in_response", lambda marker, body: marker in body)
+                    if seen_func(marker, text):
+                        findings.append({"param": param, "tested_url": test_url, "evidence": marker})
                         if do_print:
-                            print(f"{PRINT_PREFIX} response: url={test_url} status={status} time={elapsed:.3f}s len={text_len}")
+                            print(f"{globals().get('PRINT_PREFIX', '')} reflection FOUND for param='{param}' @ {test_url}")
+        except asyncio.TimeoutError:
+            if do_print:
+                print(f"{globals().get('PRINT_PREFIX', '')} timeout while requesting {test_url}")
+        except Exception:
+            if do_print:
+                print(f"{globals().get('PRINT_PREFIX', '')} request failed for {test_url}")
+                traceback.print_exc()
 
-                        if seen_in_response(marker, text):
-                            findings.append({"param": param, "tested_url": test_url, "evidence": marker})
-                            if do_print:
-                                print(f"{PRINT_PREFIX} reflection FOUND for param='{param}' @ {test_url} (marker visible)")
-                            # if you want only the first marker per param, uncomment the next line:
-                            # break
-                        else:
-                            if do_print:
-                                print(f"{PRINT_PREFIX} marker not seen in response for param='{param}'")
-
-            except asyncio.TimeoutError:
-                if do_print:
-                    print(f"{PRINT_PREFIX} timeout while requesting {test_url}")
-            except Exception:
-                if do_print:
-                    print(f"{PRINT_PREFIX} request failed for {test_url}; exception:")
-                    traceback.print_exc()
+    async with aiohttp.ClientSession() as session:
+        tasks = [test_marker(param, marker) for param in qs.keys() for marker in globals().get('XSS_MARKERS', [])]
+        await asyncio.gather(*tasks)
 
     vulnerable = bool(findings)
     if do_print:
-        print(f"{PRINT_PREFIX} finished check_reflected_xss: url={url} vulnerable={vulnerable} findings={len(findings)}")
-
+        print(f"{globals().get('PRINT_PREFIX', '')} finished check_reflected_xss: url={url} vulnerable={vulnerable} findings={len(findings)}")
     return {"vulnerable": vulnerable, "details": findings}
-async def check_sqli_fingerprints(session, url: str, sem: asyncio.Semaphore, verbose: bool = False) -> Dict:
+
+async def check_sqli_fingerprints(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore, verbose: bool = False) -> Dict:
     """
     For a single `url` with query params, inject benign SQL-like payloads and
     look for DB error signatures or large response diffs vs baseline.
     Returns {"vulnerable": bool, "details": [ {param, payload, signature, tested_url}, ... ]}
     """
     parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
     findings = []
 
-    if not qs:
+    if not qs and ('?' not in parsed.query or '=' not in parsed.query):
         return {"vulnerable": False, "details": []}
 
     # baseline
@@ -647,13 +596,13 @@ def extract_host_from_payload(payload: str) -> str:
     except Exception:
         return ""
 
-async def check_open_redirect(session, url: str, sem: asyncio.Semaphore, verbose: bool = False) -> Dict:
+async def check_open_redirect(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore, verbose: bool = False) -> Dict:
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, ParseResult
 
     parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
     findings = []
-    if not qs:
+    if not qs and ('?' not in parsed.query or '=' not in parsed.query):
         return {"vulnerable": False, "details": []}
 
     common_redirect_names = {"next", "url", "redirect", "return", "target", "r", "dest", "goto"}

